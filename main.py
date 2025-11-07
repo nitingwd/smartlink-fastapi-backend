@@ -1,61 +1,41 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import RedirectResponse
-from fastapi.openapi.docs import get_swagger_ui_html
-from database import SessionLocal, init_db
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from database import Base, engine, get_db
 from models import URL
 from schemas import URLRequest, URLResponse
-from utils import get_unique_short_url
+import string, random
 
-app = FastAPI(
-    title="SmartLink API",
-    description="FastAPI-based URL shortener",
-    version="1.0.0"
-)
+app = FastAPI()
 
-init_db()
+Base.metadata.create_all(bind=engine)
 
-# Enable CORS for frontend access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+BASE_URL = "https://smartlink-fastapi-backend.onrender.com"
 
-# Custom Swagger UI (optional)
-@app.get("/docs", include_in_schema=False)
-def custom_swagger_ui():
-    return get_swagger_ui_html(openapi_url="/openapi.json", title="SmartLink Docs")
+def generate_random_slug(length=6):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# Shorten URL endpoint
 @app.post("/api/shorten", response_model=URLResponse)
-def shorten_url(request: URLRequest):
-    db = SessionLocal()
+def shorten_url(request: URLRequest, db: Session = Depends(get_db)):
+    new_url = URL(
+        original=request.originalUrl,
+        short=request.customSlug or generate_random_slug()
+    )
+    db.add(new_url)
     try:
-        short = request.customSlug or get_unique_short_url(db, URL)
-        exists = db.query(URL).filter(URL.short_url == short).first()
-        if exists:
-            raise HTTPException(status_code=400, detail="Slug already taken")
-        new_url = URL(original_url=request.originalUrl, short_url=short)
-        db.add(new_url)
         db.commit()
         db.refresh(new_url)
-        return {"shortUrl": f"https://smartlink-backend.onrender.com/{new_url.short_url}"}
-    finally:
-        db.close()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Slug already exists")
+    return {"shortUrl": f"{BASE_URL}/{new_url.short}"}
 
-# Redirect to original URL
 @app.get("/{short}")
-def redirect_to_original(short: str):
-    db = SessionLocal()
-    try:
-        url_entry = db.query(URL).filter(URL.short_url == short).first()
-        if url_entry:
-            url_entry.clicks += 1
-            db.commit()
-            return RedirectResponse(url=url_entry.original_url)
-        raise HTTPException(status_code=404, detail="Short URL not found")
-    finally:
-        db.close()
+def redirect_to_original(short: str, db: Session = Depends(get_db)):
+    url_entry = db.query(URL).filter(URL.short == short).first()
+    if url_entry:
+        url_entry.clicks += 1
+        db.commit()
+        return RedirectResponse(url=url_entry.original)
+    raise HTTPException(status_code=404, detail="Short URL not found")
